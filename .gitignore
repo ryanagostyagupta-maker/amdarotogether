@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Uploaded PDFs (ephemeral server-side files)
+uploads/
+
+# Environment variables - NEVER commit these
+.env
+.env.local
+.env.production
+
+# Vite cache
+.vite/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
