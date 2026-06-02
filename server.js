@@ -226,6 +226,60 @@ io.on('connection', (socket) => {
     io.to(currentRoomId).emit('sync-strokes', { strokes: room ? room.strokes : [] });
   });
 
+  // PDF voting
+  socket.on('propose-pdf', ({ pdfUrl, pdfName, proposer }) => {
+    if (!currentRoomId) return;
+    const room = rooms.get(currentRoomId);
+    if (!room) return;
+
+    // Store the active proposal on the room
+    room.proposal = {
+      pdfUrl,
+      pdfName,
+      proposer,
+      votes: { yes: [socket.id], no: [] }, // proposer auto-votes yes
+      totalUsers: room.users.size,
+    };
+
+    io.to(currentRoomId).emit('pdf-proposal', room.proposal);
+
+    // Auto-accept if only 1 user in room
+    if (room.users.size === 1) {
+      io.to(currentRoomId).emit('pdf-accepted', { pdfUrl, pdfName });
+      room.pdfUrl = pdfUrl;
+      room.pdfName = pdfName;
+      room.proposal = null;
+    }
+  });
+
+  socket.on('cast-vote', ({ vote }) => {
+    if (!currentRoomId) return;
+    const room = rooms.get(currentRoomId);
+    if (!room || !room.proposal) return;
+
+    const { proposal } = room;
+    // Remove from both arrays then add to correct
+    proposal.votes.yes = proposal.votes.yes.filter(id => id !== socket.id);
+    proposal.votes.no  = proposal.votes.no.filter(id => id !== socket.id);
+    if (vote === 'yes') proposal.votes.yes.push(socket.id);
+    else                proposal.votes.no.push(socket.id);
+
+    proposal.totalUsers = room.users.size;
+    const needed = Math.ceil(room.users.size / 2);
+
+    io.to(currentRoomId).emit('pdf-vote-update', proposal);
+
+    if (proposal.votes.yes.length >= needed) {
+      io.to(currentRoomId).emit('pdf-accepted', { pdfUrl: proposal.pdfUrl, pdfName: proposal.pdfName });
+      room.pdfUrl   = proposal.pdfUrl;
+      room.pdfName  = proposal.pdfName;
+      room.proposal = null;
+    } else if (proposal.votes.no.length >= needed) {
+      io.to(currentRoomId).emit('pdf-rejected');
+      room.proposal = null;
+    }
+  });
+
   socket.on('disconnect', () => {
     if (!currentRoomId) return;
     const room = rooms.get(currentRoomId);
@@ -236,6 +290,7 @@ io.on('connection', (socket) => {
     }
   });
 });
+
 
 // In production, serve React app for any non-API route
 if (IS_PROD) {

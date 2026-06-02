@@ -12,7 +12,8 @@ const COLORS = [
 ]
 
 export default function DrawingCanvas({
-  socket, roomId, page, pdfUrl, onPageChange, totalPages, showToast, user, onSignOut
+  socket, roomId, page, pdfUrl, pdfName: pdfNameProp, onPageChange, totalPages,
+  showToast, user, onSignOut, onProposePdf, myId: myIdProp
 }) {
   const pdfCanvasRef = useRef()
   const drawCanvasRef = useRef()
@@ -25,11 +26,17 @@ export default function DrawingCanvas({
   const [zoom, setZoom]               = useState(1)
   const [loading, setLoading]         = useState(true)
   const [users, setUsers]             = useState([])
-  const [myId, setMyId]               = useState(null)
+  const [myId, setMyId]               = useState(myIdProp || null)
   const [inviteCode, setInviteCode]   = useState('')
   const [copied, setCopied]           = useState(false)
-  const [pdfName, setPdfName]         = useState('')
+  const [pdfName, setPdfName]         = useState(pdfNameProp || '')
   const [sidebarOpen, setSidebarOpen] = useState(true)
+  const proposeInputRef               = useRef()
+
+  // Text tool state
+  const [textPos, setTextPos]     = useState(null)   // {x, y} in canvas coords
+  const [textVal, setTextVal]     = useState('')
+  const textInputRef              = useRef()
 
   const pdfDocRef   = useRef(null)
   const isDrawing   = useRef(false)
@@ -183,19 +190,108 @@ export default function DrawingCanvas({
       .forEach(s => drawStroke(ctx, s))
   }, [])
 
+  // ── GoodNotes-style smooth pen ──────────────────────
+  const drawSmoothPen = (ctx, points, baseWidth, color, opacity) => {
+    if (!points.length) return
+    ctx.save()
+    ctx.globalAlpha = opacity ?? 1
+    ctx.fillStyle   = color
+    ctx.globalCompositeOperation = 'source-over'
+
+    if (points.length === 1) {
+      ctx.beginPath()
+      ctx.arc(points[0].x, points[0].y, baseWidth / 2, 0, Math.PI * 2)
+      ctx.fill()
+      ctx.restore()
+      return
+    }
+
+    const n = points.length
+
+    // Per-point width: simulate pressure via inverse speed
+    const widths = new Array(n)
+    widths[0]     = baseWidth * 0.3          // tapered start
+    widths[n - 1] = baseWidth * 0.1          // tapered end
+    for (let i = 1; i < n - 1; i++) {
+      const dx    = points[i + 1].x - points[i - 1].x
+      const dy    = points[i + 1].y - points[i - 1].y
+      const speed = Math.sqrt(dx * dx + dy * dy)
+      const t     = Math.min(1, speed / (baseWidth * 9 + 1))
+      widths[i]   = baseWidth * Math.max(0.15, 1 - t * 0.65)
+    }
+
+    // Build left/right outline using segment normals
+    const left  = []
+    const right = []
+    for (let i = 0; i < n - 1; i++) {
+      const p1 = points[i], p2 = points[i + 1]
+      const dx = p2.x - p1.x, dy = p2.y - p1.y
+      const len = Math.sqrt(dx * dx + dy * dy) || 1
+      const nx = -dy / len, ny = dx / len
+      const w1h = widths[i] / 2, w2h = widths[i + 1] / 2
+      if (i === 0) {
+        left.push({ x: p1.x + nx * w1h, y: p1.y + ny * w1h })
+        right.push({ x: p1.x - nx * w1h, y: p1.y - ny * w1h })
+      }
+      left.push({ x: p2.x + nx * w2h, y: p2.y + ny * w2h })
+      right.push({ x: p2.x - nx * w2h, y: p2.y - ny * w2h })
+    }
+
+    // Smooth the outline with quadratic Bezier midpoints
+    const all = [...left, ...[...right].reverse()]
+    ctx.beginPath()
+    ctx.moveTo(all[0].x, all[0].y)
+    for (let i = 1; i < all.length - 1; i++) {
+      const mx = (all[i].x + all[i + 1].x) / 2
+      const my = (all[i].y + all[i + 1].y) / 2
+      ctx.quadraticCurveTo(all[i].x, all[i].y, mx, my)
+    }
+    ctx.closePath()
+    ctx.fill()
+    ctx.restore()
+  }
+
   const drawStroke = (ctx, stroke) => {
     if (!stroke?.points?.length) return
     ctx.save()
     ctx.globalAlpha = stroke.opacity ?? 1
 
+    // ── Text ──
+    if (stroke.tool === 'text') {
+      ctx.globalCompositeOperation = 'source-over'
+      ctx.fillStyle = stroke.color
+      ctx.font = `${Math.max(12, stroke.width * 4)}px Inter, -apple-system, sans-serif`
+      ctx.fillText(stroke.text || '', stroke.points[0].x, stroke.points[0].y)
+      ctx.restore(); return
+    }
+
+    // ── Eraser ──
     if (stroke.tool === 'eraser') {
       ctx.globalCompositeOperation = 'destination-out'
       ctx.strokeStyle = 'rgba(0,0,0,1)'
-    } else if (stroke.tool === 'highlighter') {
+      ctx.lineWidth = stroke.width
+      ctx.lineCap = 'round'; ctx.lineJoin = 'round'
+      ctx.beginPath()
+      stroke.points.forEach((pt, i) => i === 0 ? ctx.moveTo(pt.x, pt.y) : ctx.lineTo(pt.x, pt.y))
+      ctx.stroke()
+      ctx.restore(); return
+    }
+
+    // ── Highlighter ──
+    if (stroke.tool === 'highlighter') {
       ctx.globalCompositeOperation = 'source-over'
+      ctx.globalAlpha = 0.3
       ctx.strokeStyle = stroke.color
-      ctx.globalAlpha = 0.35
-    } else if (stroke.tool === 'rectangle') {
+      ctx.lineWidth = stroke.width * 6
+      ctx.lineCap = 'square'; ctx.lineJoin = 'round'
+      ctx.beginPath()
+      stroke.points.forEach((pt, i) => i === 0 ? ctx.moveTo(pt.x, pt.y) : ctx.lineTo(pt.x, pt.y))
+      ctx.stroke()
+      ctx.restore(); return
+    }
+
+    // ── Rectangle ──
+    if (stroke.tool === 'rectangle') {
       ctx.globalCompositeOperation = 'source-over'
       ctx.strokeStyle = stroke.color
       ctx.fillStyle   = stroke.color + '22'
@@ -208,7 +304,10 @@ export default function DrawingCanvas({
         ctx.fill(); ctx.stroke()
       }
       ctx.restore(); return
-    } else if (stroke.tool === 'arrow') {
+    }
+
+    // ── Arrow ──
+    if (stroke.tool === 'arrow') {
       ctx.globalCompositeOperation = 'source-over'
       ctx.strokeStyle = stroke.color
       ctx.fillStyle   = stroke.color
@@ -218,6 +317,7 @@ export default function DrawingCanvas({
         const angle = Math.atan2(e.y - s.y, e.x - s.x)
         const head  = 14 + stroke.width * 2
         ctx.lineWidth = stroke.width
+        ctx.lineCap = 'round'
         ctx.beginPath(); ctx.moveTo(s.x, s.y); ctx.lineTo(e.x, e.y); ctx.stroke()
         ctx.beginPath()
         ctx.moveTo(e.x, e.y)
@@ -226,18 +326,11 @@ export default function DrawingCanvas({
         ctx.closePath(); ctx.fill()
       }
       ctx.restore(); return
-    } else {
-      ctx.globalCompositeOperation = 'source-over'
-      ctx.strokeStyle = stroke.color
     }
 
-    ctx.lineWidth = stroke.width
-    ctx.lineCap   = 'round'
-    ctx.lineJoin  = 'round'
-    ctx.beginPath()
-    stroke.points.forEach((pt, i) => i === 0 ? ctx.moveTo(pt.x, pt.y) : ctx.lineTo(pt.x, pt.y))
-    ctx.stroke()
+    // ── Pen (GoodNotes style) ──
     ctx.restore()
+    drawSmoothPen(ctx, stroke.points, stroke.width, stroke.color, stroke.opacity ?? 1)
   }
 
   // ── Pointer events ────────────────────────────────────
@@ -252,7 +345,14 @@ export default function DrawingCanvas({
   }
 
   const onPointerDown = (e) => {
-    if (toolRef.current === 'text') return
+    // Text tool: place text input at click position
+    if (toolRef.current === 'text') {
+      const pos = getPos(e)
+      setTextPos(pos)
+      setTextVal('')
+      setTimeout(() => textInputRef.current?.focus(), 0)
+      return
+    }
     e.preventDefault()
     isDrawing.current = true
     const pos = getPos(e)
@@ -327,6 +427,28 @@ export default function DrawingCanvas({
     showToast('Share link copied!', 'success')
   }
 
+  // Commit text to canvas + sync
+  const commitText = () => {
+    if (!textPos || !textVal.trim()) { setTextPos(null); return }
+    const ctx = drawCanvasRef.current?.getContext('2d')
+    if (!ctx) { setTextPos(null); return }
+    const stroke = {
+      tool: 'text',
+      points: [textPos],
+      text: textVal.trim(),
+      color: colorRef.current,
+      width: widthRef.current,
+      opacity: opacityRef.current,
+      page: pageRef.current,
+    }
+    strokes.current.push(stroke)
+    undoStack.current.push(stroke)
+    drawStroke(ctx, stroke)
+    socket?.emit('draw-end', { stroke, page: pageRef.current })
+    setTextPos(null)
+    setTextVal('')
+  }
+
   const copyInviteCode = () => {
     navigator.clipboard.writeText(inviteCode)
     setCopied(true)
@@ -345,163 +467,108 @@ export default function DrawingCanvas({
     <div className="workspace">
       {/* ── Sidebar ── */}
       <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`}>
-        <div className="sidebar-header" style={{ padding: '16px', borderBottom: '1px solid var(--border)' }}>
-          <div>
-            <div className="sidebar-logo" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <img src="/logo.svg" alt="Amdaro Logo" style={{ width: 20, height: 20 }} />
-              <span style={{ fontSize: 16, fontWeight: 700, letterSpacing: '-0.3px' }}>Amdaro</span>
-            </div>
-            {pdfName && (
-              <div className="sidebar-pdf-name" style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '2px' }} title={pdfName}>
-                {pdfName}
-              </div>
-            )}
+
+        {/* Header */}
+        <div style={{ padding: '14px 16px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottom: '1px solid var(--border)' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <img src="/logo.svg" alt="Amdaro" style={{ width: 18, height: 18 }} />
+            <span style={{ fontSize: 14, fontWeight: 700, letterSpacing: '-0.3px', color: '#fff' }}>amdaro</span>
           </div>
-          <button className="copy-btn" onClick={() => setSidebarOpen(false)} style={{ fontSize: 14 }} title="Close">✕</button>
+          <button onClick={() => setSidebarOpen(false)} style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', fontSize: 14, lineHeight: 1 }}>✕</button>
         </div>
 
-        {/* Color Palette */}
-        <div className="sidebar-section" style={{ padding: '12px 16px', borderBottom: '1px solid var(--border)' }}>
-          <div className="sidebar-section-title" style={{ fontSize: 10, marginBottom: 8 }}>Color</div>
-          <div className="color-palette" style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+        {/* PDF name pill */}
+        {pdfName && (
+          <div style={{ padding: '8px 16px', borderBottom: '1px solid var(--border)' }}>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={pdfName}>
+              📄 {pdfName}
+            </div>
+          </div>
+        )}
+
+        {/* Color swatches */}
+        <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border)' }}>
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
             {COLORS.slice(0, 8).map(c => (
               <div
                 key={c}
-                className={`color-swatch ${color === c ? 'active' : ''}`}
-                style={{
-                  width: 18,
-                  height: 18,
-                  borderRadius: '50%',
-                  background: c,
-                  border: color === c ? '2px solid #ffffff' : '1px solid rgba(255,255,255,0.1)',
-                  boxShadow: 'none',
-                  cursor: 'pointer',
-                  transform: color === c ? 'scale(1.1)' : 'none',
-                  transition: 'all var(--transition)'
-                }}
                 onClick={() => setColor(c)}
-                title={c}
+                style={{
+                  width: 16, height: 16, borderRadius: '50%', background: c,
+                  border: color === c ? '2px solid #fff' : '1px solid rgba(255,255,255,0.1)',
+                  cursor: 'pointer',
+                  transform: color === c ? 'scale(1.15)' : 'none',
+                  transition: 'transform 0.15s'
+                }}
               />
             ))}
-            <label className="color-input-wrap" style={{
-              width: 18,
-              height: 18,
-              borderRadius: '50%',
-              fontSize: 10,
-              border: '1px solid rgba(255,255,255,0.15)',
-              background: 'rgba(255,255,255,0.03)',
-              cursor: 'pointer',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              position: 'relative'
-            }} title="Custom color">
-              🎨
-              <input
-                type="color"
-                value={color}
-                onChange={e => setColor(e.target.value)}
-                style={{ position: 'absolute', opacity: 0, width: 0, height: 0 }}
-              />
+            <label style={{ width: 16, height: 16, borderRadius: '50%', border: '1px dashed rgba(255,255,255,0.2)', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 9, position: 'relative' }} title="Custom">
+              +
+              <input type="color" value={color} onChange={e => setColor(e.target.value)} style={{ position: 'absolute', opacity: 0, width: 0, height: 0 }} />
             </label>
           </div>
         </div>
 
-        {/* Stroke controls */}
-        <div className="sidebar-section" style={{ padding: '12px 16px', borderBottom: '1px solid var(--border)' }}>
-          <div className="sidebar-section-title" style={{ fontSize: 10, marginBottom: 8 }}>Stroke</div>
-          <div className="stroke-controls" style={{ gap: 8 }}>
-            <div className="stroke-row" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: 12 }}>
-              <span style={{ color: 'var(--text-secondary)' }}>Size</span>
-              <input
-                type="range" min="1" max="30" value={strokeWidth}
-                onChange={e => setStrokeWidth(+e.target.value)}
-                className="stroke-slider"
-                style={{ flex: 1, margin: '0 8px', height: 2 }}
-              />
-              <span style={{ color: 'var(--text-muted)', width: 28, textAlign: 'right' }}>{strokeWidth}px</span>
-            </div>
-            {tool !== 'highlighter' && tool !== 'eraser' && (
-              <div className="stroke-row" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: 12, marginTop: 8 }}>
-                <span style={{ color: 'var(--text-secondary)' }}>Opacity</span>
-                <input
-                  type="range" min="10" max="100"
-                  value={Math.round(opacity * 100)}
-                  onChange={e => setOpacity(e.target.value / 100)}
-                  className="stroke-slider"
-                  style={{ flex: 1, margin: '0 8px', height: 2 }}
-                />
-                <span style={{ color: 'var(--text-muted)', width: 28, textAlign: 'right' }}>{Math.round(opacity * 100)}%</span>
-              </div>
-            )}
-          </div>
+        {/* Stroke size */}
+        <div style={{ padding: '10px 16px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 10 }}>
+          <span style={{ fontSize: 11, color: 'var(--text-muted)', minWidth: 28 }}>{strokeWidth}px</span>
+          <input
+            type="range" min="1" max="30" value={strokeWidth}
+            onChange={e => setStrokeWidth(+e.target.value)}
+            className="stroke-slider"
+            style={{ flex: 1, height: 2 }}
+          />
         </div>
 
-        {/* Room Invite Code */}
-        <div className="sidebar-section" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 16px', borderBottom: '1px solid var(--border)' }}>
-          <span style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Session Code</span>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-            <span style={{ fontFamily: 'monospace', fontSize: 13, color: '#ffffff', fontWeight: 600 }}>{inviteCode || '------'}</span>
-            <button
-              onClick={copyInviteCode}
-              style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', padding: 2, display: 'flex' }}
-              title="Copy"
-            >
-              {copied ? '✓' : '⎘'}
-            </button>
-          </div>
+        {/* Session code */}
+        <div style={{ padding: '10px 16px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <span style={{ fontFamily: 'monospace', fontSize: 12, color: '#fff', fontWeight: 600, letterSpacing: 1 }}>{inviteCode || '------'}</span>
+          <button onClick={copyInviteCode} style={{ background: 'none', border: 'none', color: copied ? '#22c55e' : 'var(--text-muted)', cursor: 'pointer', fontSize: 13 }} title="Copy code">
+            {copied ? '✓' : '⎘'}
+          </button>
         </div>
 
-        {/* Online Users */}
-        <div className="sidebar-section" style={{ flex: 1, overflowY: 'auto', padding: '12px 16px' }}>
-          <div className="sidebar-section-title" style={{ fontSize: 10, marginBottom: 8 }}>Online ({users.length})</div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        {/* Online users */}
+        <div style={{ flex: 1, overflowY: 'auto', padding: '10px 16px' }}>
+          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.5px' }}>Online · {users.length}</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
             {users.map(u => (
               <div key={u.id} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <div style={{ width: 6, height: 6, borderRadius: '50%', background: u.color }} />
-                <span style={{ fontSize: 13, color: 'var(--text-secondary)' }}>{u.name}</span>
-                {u.id === myId && <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>(You)</span>}
+                <div style={{ width: 6, height: 6, borderRadius: '50%', background: u.color, flexShrink: 0 }} />
+                <span style={{ fontSize: 12, color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{u.name}{u.id === myId ? ' (you)' : ''}</span>
               </div>
             ))}
           </div>
         </div>
 
-        {/* User Account / Sign Out */}
-        {user && (
-          <div style={{
-            padding: '12px 16px',
-            borderTop: '1px solid var(--border)',
-            background: 'rgba(255,255,255,0.01)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            gap: 12
-          }}>
-            <div style={{
-              fontSize: 11,
-              color: 'var(--text-muted)',
-              textOverflow: 'ellipsis',
-              overflow: 'hidden',
-              whiteSpace: 'nowrap',
-              maxWidth: 160
-            }} title={user.email}>
-              {user.email}
-            </div>
+        {/* Propose PDF button */}
+        {onProposePdf && (
+          <div style={{ padding: '10px 16px', borderTop: '1px solid var(--border)' }}>
             <button
-              onClick={onSignOut}
+              onClick={() => proposeInputRef.current?.click()}
               style={{
-                background: 'transparent',
-                border: 'none',
-                color: '#ef4444',
-                fontSize: 11,
-                fontWeight: 600,
-                cursor: 'pointer',
-                padding: '4px 8px',
-                textDecoration: 'underline'
+                width: '100%', padding: '8px 0', borderRadius: 8,
+                border: '1px solid rgba(255,255,255,0.1)',
+                background: 'rgba(255,255,255,0.04)',
+                color: 'rgba(255,255,255,0.6)', fontSize: 12, fontWeight: 500,
+                cursor: 'pointer', transition: 'all 0.15s',
               }}
+              onMouseEnter={e => e.target.style.background = 'rgba(255,255,255,0.08)'}
+              onMouseLeave={e => e.target.style.background = 'rgba(255,255,255,0.04)'}
             >
-              Sign Out
+              📤 Propose PDF switch
             </button>
+            <input ref={proposeInputRef} type="file" accept="application/pdf" style={{ display: 'none' }}
+              onChange={e => { onProposePdf(e.target.files[0]); e.target.value = '' }}
+            />
+          </div>
+        )}
+
+        {/* Sign out */}
+        {user && (
+          <div style={{ padding: '10px 16px', borderTop: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <span style={{ fontSize: 11, color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 140 }} title={user.email}>{user.email}</span>
+            <button onClick={onSignOut} style={{ background: 'none', border: 'none', color: '#ef4444', fontSize: 11, fontWeight: 600, cursor: 'pointer', flexShrink: 0 }}>Sign out</button>
           </div>
         )}
       </aside>
@@ -561,6 +628,51 @@ export default function DrawingCanvas({
               onTouchMove={onPointerMove}
               onTouchEnd={onPointerUp}
             />
+            {/* Text tool input overlay */}
+            {textPos && (() => {
+              const canvas = drawCanvasRef.current
+              const rect   = canvas?.getBoundingClientRect()
+              const scaleX = rect ? canvas.width  / rect.width  : 1
+              const scaleY = rect ? canvas.height / rect.height : 1
+              const left   = rect ? rect.left + textPos.x / scaleX : textPos.x
+              const top    = rect ? rect.top  + textPos.y / scaleY : textPos.y
+              const fontSize = Math.max(12, strokeWidth * 4)
+              return (
+                <textarea
+                  ref={textInputRef}
+                  value={textVal}
+                  onChange={e => setTextVal(e.target.value)}
+                  onKeyDown={e => {
+                    if (e.key === 'Escape') { setTextPos(null); setTextVal('') }
+                    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); commitText() }
+                  }}
+                  onBlur={commitText}
+                  style={{
+                    position: 'fixed',
+                    left, top,
+                    minWidth: 120,
+                    maxWidth: 400,
+                    background: 'rgba(0,0,0,0.6)',
+                    backdropFilter: 'blur(8px)',
+                    border: `1px solid ${color}44`,
+                    borderRadius: 6,
+                    color,
+                    fontSize,
+                    fontFamily: 'Inter, -apple-system, sans-serif',
+                    padding: '4px 8px',
+                    outline: 'none',
+                    resize: 'none',
+                    overflow: 'hidden',
+                    lineHeight: 1.4,
+                    zIndex: 1000,
+                    boxShadow: `0 0 0 2px ${color}33`,
+                    rows: 1,
+                  }}
+                  rows={1}
+                  placeholder="Type text…"
+                />
+              )
+            })()}
           </div>
         </div>
 
