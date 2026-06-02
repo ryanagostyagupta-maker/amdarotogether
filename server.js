@@ -239,7 +239,7 @@ io.on('connection', (socket) => {
 
 // In production, serve React app for any non-API route
 if (IS_PROD) {
-  app.get('*', (req, res) => {
+  app.get('/{*path}', (req, res) => {
     res.sendFile(path.join(__dirname, 'dist', 'index.html'));
   });
 }
