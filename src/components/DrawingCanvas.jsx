@@ -1,6 +1,7 @@
 import { useEffect, useRef, useCallback, useState } from 'react'
 import * as pdfjsLib from 'pdfjs-dist'
 import { DrawingToolbar } from './Toolbar'
+import ColorPicker from './ColorPicker'
 
 import { version } from 'pdfjs-dist'
 pdfjsLib.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${version}/build/pdf.worker.min.mjs`
@@ -566,94 +567,105 @@ export default function DrawingCanvas({
       <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`}>
 
         {/* Header */}
-        <div style={{ padding: '14px 16px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottom: '1px solid var(--border)' }}>
+        <div className="sb-row" style={{ justifyContent: 'space-between', padding: '12px 14px' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <img src="/logo.svg" alt="Amdaro" style={{ width: 18, height: 18 }} />
-            <span style={{ fontSize: 14, fontWeight: 700, letterSpacing: '-0.3px', color: '#fff' }}>amdaro</span>
+            <img src="/logo.svg" alt="Amdaro" style={{ width: 16, height: 16, opacity: 0.9 }} />
+            <span style={{ fontSize: 13, fontWeight: 700, letterSpacing: '-0.3px', color: 'rgba(255,255,255,0.9)' }}>amdaro</span>
           </div>
-          <button onClick={() => setSidebarOpen(false)} style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', fontSize: 14, lineHeight: 1 }}>✕</button>
+          <button className="sb-icon-btn" onClick={() => setSidebarOpen(false)} title="Close">
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
+              <path d="M1 1l10 10M11 1L1 11" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
+            </svg>
+          </button>
         </div>
 
-        {/* PDF name pill */}
+        {/* PDF name */}
         {pdfName && (
-          <div style={{ padding: '8px 16px', borderBottom: '1px solid var(--border)' }}>
-            <div style={{ fontSize: 11, color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={pdfName}>
-              📄 {pdfName}
-            </div>
+          <div className="sb-row" style={{ gap: 6 }}>
+            <span style={{ fontSize: 10, opacity: 0.4 }}>📄</span>
+            <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.45)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={pdfName}>
+              {pdfName}
+            </span>
           </div>
         )}
 
-        {/* Color swatches */}
-        <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border)' }}>
-          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
-            {COLORS.slice(0, 8).map(c => (
-              <div
-                key={c}
-                onClick={() => setColor(c)}
-                style={{
-                  width: 16, height: 16, borderRadius: '50%', background: c,
-                  border: color === c ? '2px solid #fff' : '1px solid rgba(255,255,255,0.1)',
-                  cursor: 'pointer',
-                  transform: color === c ? 'scale(1.15)' : 'none',
-                  transition: 'transform 0.15s'
-                }}
-              />
-            ))}
-            <label style={{ width: 16, height: 16, borderRadius: '50%', border: '1px dashed rgba(255,255,255,0.2)', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 9, position: 'relative' }} title="Custom">
-              +
-              <input type="color" value={color} onChange={e => setColor(e.target.value)} style={{ position: 'absolute', opacity: 0, width: 0, height: 0 }} />
-            </label>
+        {/* Colour picker */}
+        <div className="sb-row" style={{ flexDirection: 'column', alignItems: 'stretch', gap: 10, padding: '12px 14px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <span className="sb-label">Colour</span>
+            <ColorPicker color={color} onChange={setColor} />
           </div>
         </div>
 
         {/* Stroke size */}
-        <div style={{ padding: '10px 16px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 10 }}>
-          <span style={{ fontSize: 11, color: 'var(--text-muted)', minWidth: 28 }}>{strokeWidth}px</span>
+        <div className="sb-row" style={{ gap: 10 }}>
+          <span className="sb-label" style={{ minWidth: 30 }}>{strokeWidth}px</span>
           <input
             type="range" min="1" max="30" value={strokeWidth}
+            className="sb-slider"
             onChange={e => setStrokeWidth(+e.target.value)}
-            className="stroke-slider"
-            style={{ flex: 1, height: 2 }}
+            style={{ flex: 1, accentColor: color }}
           />
         </div>
 
+        {/* Opacity */}
+        {tool !== 'highlighter' && tool !== 'eraser' && (
+          <div className="sb-row" style={{ gap: 10 }}>
+            <span className="sb-label" style={{ minWidth: 30 }}>{Math.round(opacity * 100)}%</span>
+            <input
+              type="range" min="10" max="100"
+              value={Math.round(opacity * 100)}
+              className="sb-slider"
+              onChange={e => setOpacity(e.target.value / 100)}
+              style={{ flex: 1, accentColor: color }}
+            />
+          </div>
+        )}
+
         {/* Session code */}
-        <div style={{ padding: '10px 16px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          <span style={{ fontFamily: 'monospace', fontSize: 12, color: '#fff', fontWeight: 600, letterSpacing: 1 }}>{inviteCode || '------'}</span>
-          <button onClick={copyInviteCode} style={{ background: 'none', border: 'none', color: copied ? '#22c55e' : 'var(--text-muted)', cursor: 'pointer', fontSize: 13 }} title="Copy code">
-            {copied ? '✓' : '⎘'}
+        <div className="sb-row" style={{ justifyContent: 'space-between' }}>
+          <span className="sb-code">{inviteCode || '— — — — — —'}</span>
+          <button
+            className="sb-icon-btn"
+            onClick={copyInviteCode}
+            title="Copy session code"
+            style={{ color: copied ? '#22c55e' : undefined }}
+          >
+            {copied
+              ? <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M2 7l3.5 3.5L12 3" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+              : <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><rect x="4" y="1" width="9" height="9" rx="2" stroke="currentColor" strokeWidth="1.2"/><path d="M1 5v8h8" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/></svg>
+            }
           </button>
         </div>
 
         {/* Online users */}
-        <div style={{ flex: 1, overflowY: 'auto', padding: '10px 16px' }}>
-          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.5px' }}>Online · {users.length}</div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+        <div style={{ flex: 1, overflowY: 'auto', padding: '10px 14px 6px' }}>
+          <div className="sb-label" style={{ marginBottom: 10 }}>Online · {users.length}</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
             {users.map(u => (
               <div key={u.id} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <div style={{ width: 6, height: 6, borderRadius: '50%', background: u.color, flexShrink: 0 }} />
-                <span style={{ fontSize: 12, color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{u.name}{u.id === myId ? ' (you)' : ''}</span>
+                <div className="sb-user-dot" style={{ background: u.color, color: u.color }} />
+                <span style={{
+                  fontSize: 12, color: 'rgba(255,255,255,0.6)',
+                  overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                  fontWeight: u.id === myId ? 500 : 400,
+                }}>
+                  {u.name}{u.id === myId ? <span style={{ color: 'rgba(255,255,255,0.25)', fontSize: 10 }}> you</span> : null}
+                </span>
               </div>
             ))}
           </div>
         </div>
 
-        {/* Propose PDF button */}
+        {/* Propose PDF */}
         {onProposePdf && (
-          <div style={{ padding: '10px 16px', borderTop: '1px solid var(--border)' }}>
-            <button
-              onClick={() => proposeInputRef.current?.click()}
-              style={{
-                width: '100%', padding: '8px 0', borderRadius: 8,
-                border: '1px solid rgba(255,255,255,0.1)',
-                background: 'rgba(255,255,255,0.04)',
-                color: 'rgba(255,255,255,0.6)', fontSize: 12, fontWeight: 500,
-                cursor: 'pointer', transition: 'all 0.15s',
-              }}
-              onMouseEnter={e => e.target.style.background = 'rgba(255,255,255,0.08)'}
-              onMouseLeave={e => e.target.style.background = 'rgba(255,255,255,0.04)'}
-            >
-              📤 Propose PDF switch
+          <div style={{ padding: '8px 14px', borderTop: '1px solid rgba(255,255,255,0.04)' }}>
+            <button className="sb-propose-btn" onClick={() => proposeInputRef.current?.click()}>
+              <svg width="13" height="13" viewBox="0 0 13 13" fill="none">
+                <path d="M6.5 1v8M2.5 5l4-4 4 4" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"/>
+                <path d="M1 11h11" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/>
+              </svg>
+              Propose PDF
             </button>
             <input ref={proposeInputRef} type="file" accept="application/pdf" style={{ display: 'none' }}
               onChange={e => { onProposePdf(e.target.files[0]); e.target.value = '' }}
@@ -663,9 +675,18 @@ export default function DrawingCanvas({
 
         {/* Sign out */}
         {user && (
-          <div style={{ padding: '10px 16px', borderTop: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <span style={{ fontSize: 11, color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 140 }} title={user.email}>{user.email}</span>
-            <button onClick={onSignOut} style={{ background: 'none', border: 'none', color: '#ef4444', fontSize: 11, fontWeight: 600, cursor: 'pointer', flexShrink: 0 }}>Sign out</button>
+          <div className="sb-row" style={{ justifyContent: 'space-between', padding: '10px 14px' }}>
+            <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.3)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 140 }} title={user.email}>
+              {user.email}
+            </span>
+            <button
+              onClick={onSignOut}
+              style={{ background: 'none', border: 'none', color: 'rgba(239,68,68,0.7)', fontSize: 11, fontWeight: 600, cursor: 'pointer', flexShrink: 0, transition: 'color 0.15s' }}
+              onMouseEnter={e => e.target.style.color = '#ef4444'}
+              onMouseLeave={e => e.target.style.color = 'rgba(239,68,68,0.7)'}
+            >
+              Sign out
+            </button>
           </div>
         )}
       </aside>
