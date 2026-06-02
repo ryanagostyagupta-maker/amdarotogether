@@ -841,11 +841,19 @@ body {
   z-index: 1;
 }
 
+#static-canvas {
+  display: block;
+  position: absolute;
+  top: 0; left: 0;
+  z-index: 2;
+  pointer-events: none;
+}
+
 #draw-canvas {
   position: absolute;
   top: 0;
   left: 0;
-  z-index: 2;
+  z-index: 3;
   touch-action: none;
 }
 

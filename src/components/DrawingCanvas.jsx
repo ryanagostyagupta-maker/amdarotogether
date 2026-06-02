@@ -15,9 +15,10 @@ export default function DrawingCanvas({
   socket, roomId, page, pdfUrl, pdfName: pdfNameProp, onPageChange, totalPages,
   showToast, user, onSignOut, onProposePdf, myId: myIdProp
 }) {
-  const pdfCanvasRef = useRef()
-  const drawCanvasRef = useRef()
-  const containerRef = useRef()
+  const pdfCanvasRef    = useRef()
+  const staticCanvasRef = useRef()   // committed strokes layer
+  const drawCanvasRef   = useRef()   // live / in-progress stroke layer
+  const containerRef    = useRef()
 
   const [tool, setTool]               = useState('pen')
   const [color, setColor]             = useState('#7c6aff')
@@ -95,6 +96,10 @@ export default function DrawingCanvas({
 
       pdfCanvas.width  = viewport.width
       pdfCanvas.height = viewport.height
+      if (staticCanvasRef.current) {
+        staticCanvasRef.current.width  = viewport.width
+        staticCanvasRef.current.height = viewport.height
+      }
       drawCanvas.width  = viewport.width
       drawCanvas.height = viewport.height
 
@@ -137,15 +142,32 @@ export default function DrawingCanvas({
       const path = remotePaths.current[userId]
       if (!path) return
       path.points.push({ x, y })
-      redrawStrokes()
+      // Draw remote live stroke on the live canvas
       const ctx = drawCanvasRef.current?.getContext('2d')
-      if (ctx) drawStroke(ctx, { ...path, page: pageRef.current })
+      if (ctx) {
+        ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height)
+        Object.values(remotePaths.current).forEach(p =>
+          drawStroke(ctx, { ...p, page: pageRef.current })
+        )
+      }
     })
 
     socket.on('draw-end', ({ userId, stroke }) => {
-      if (stroke) strokes.current.push(stroke)
+      // Commit remote stroke to static canvas
+      if (stroke) {
+        strokes.current.push(stroke)
+        const ctx = staticCanvasRef.current?.getContext('2d')
+        if (ctx) drawStroke(ctx, stroke)
+      }
       delete remotePaths.current[userId]
-      redrawStrokes()
+      // Clear live canvas of this remote user's in-progress stroke
+      const drawCtx = drawCanvasRef.current?.getContext('2d')
+      if (drawCtx) {
+        drawCtx.clearRect(0, 0, drawCtx.canvas.width, drawCtx.canvas.height)
+        Object.values(remotePaths.current).forEach(p =>
+          drawStroke(drawCtx, { ...p, page: pageRef.current })
+        )
+      }
     })
 
     socket.on('page-change', ({ page: newPage }) => onPageChange(newPage))
@@ -180,14 +202,18 @@ export default function DrawingCanvas({
   }, [socket, onPageChange])
 
   // ── Drawing helpers ───────────────────────────────────
+  // Redraws all committed strokes onto the STATIC canvas (not called every frame)
   const redrawStrokes = useCallback(() => {
-    const canvas = drawCanvasRef.current
+    const canvas = staticCanvasRef.current
     if (!canvas) return
     const ctx = canvas.getContext('2d')
     ctx.clearRect(0, 0, canvas.width, canvas.height)
     strokes.current
       .filter(s => s.page === pageRef.current)
       .forEach(s => drawStroke(ctx, s))
+    // Also clear the live canvas
+    const live = drawCanvasRef.current
+    if (live) live.getContext('2d').clearRect(0, 0, live.width, live.height)
   }, [])
 
   // ── GoodNotes-style smooth pen ──────────────────────
@@ -334,76 +360,147 @@ export default function DrawingCanvas({
   }
 
   // ── Pointer events ────────────────────────────────────
-  const getPos = (e) => {
+  // ── Native Pointer Events (low-latency, Apple Pencil aware) ──────────
+  const rafRef = useRef(null)
+
+  useEffect(() => {
     const canvas = drawCanvasRef.current
-    const rect   = canvas.getBoundingClientRect()
-    const scaleX = canvas.width  / rect.width
-    const scaleY = canvas.height / rect.height
-    const cx = e.touches ? e.touches[0].clientX : e.clientX
-    const cy = e.touches ? e.touches[0].clientY : e.clientY
-    return { x: (cx - rect.left) * scaleX, y: (cy - rect.top) * scaleY }
-  }
+    if (!canvas) return
 
-  const onPointerDown = (e) => {
-    // Text tool: place text input at click position
-    if (toolRef.current === 'text') {
-      const pos = getPos(e)
-      setTextPos(pos)
-      setTextVal('')
-      setTimeout(() => textInputRef.current?.focus(), 0)
-      return
+    const getCanvasPos = (e) => {
+      const rect  = canvas.getBoundingClientRect()
+      const scaleX = canvas.width  / rect.width
+      const scaleY = canvas.height / rect.height
+      return {
+        x: (e.clientX - rect.left) * scaleX,
+        y: (e.clientY - rect.top)  * scaleY,
+        pressure: e.pressure > 0 ? e.pressure : 0.5,
+      }
     }
-    e.preventDefault()
-    isDrawing.current = true
-    const pos = getPos(e)
-    currentPath.current = [pos]
-    socket?.emit('draw-start', {
-      x: pos.x, y: pos.y,
-      tool: toolRef.current,
-      color: colorRef.current,
-      width: toolRef.current === 'eraser' ? widthRef.current * 4 : widthRef.current,
-      opacity: toolRef.current === 'highlighter' ? 0.35 : opacityRef.current,
-      page: pageRef.current,
-    })
-  }
 
-  const onPointerMove = (e) => {
-    if (!isDrawing.current) return
-    e.preventDefault()
-    const pos = getPos(e)
-    currentPath.current.push(pos)
-
-    const canvas = drawCanvasRef.current
-    const ctx    = canvas.getContext('2d')
-    redrawStrokes()
-    drawStroke(ctx, {
-      points:  currentPath.current,
-      tool:    toolRef.current,
-      color:   colorRef.current,
-      width:   toolRef.current === 'eraser' ? widthRef.current * 4 : widthRef.current,
-      opacity: toolRef.current === 'highlighter' ? 0.35 : opacityRef.current,
-      page:    pageRef.current,
-    })
-    socket?.emit('draw-move', { x: pos.x, y: pos.y, page: pageRef.current })
-  }
-
-  const onPointerUp = () => {
-    if (!isDrawing.current) return
-    isDrawing.current = false
-    const stroke = {
-      points:  currentPath.current,
-      tool:    toolRef.current,
-      color:   colorRef.current,
-      width:   toolRef.current === 'eraser' ? widthRef.current * 4 : widthRef.current,
-      opacity: toolRef.current === 'highlighter' ? 0.35 : opacityRef.current,
-      page:    pageRef.current,
+    const onDown = (e) => {
+      if (toolRef.current === 'text') {
+        const pos = getCanvasPos(e)
+        setTextPos({ x: pos.x, y: pos.y })
+        setTextVal('')
+        setTimeout(() => textInputRef.current?.focus(), 0)
+        return
+      }
+      e.preventDefault()
+      canvas.setPointerCapture(e.pointerId)
+      isDrawing.current = true
+      const pos = getCanvasPos(e)
+      currentPath.current = [pos]
+      socket?.emit('draw-start', {
+        x: pos.x, y: pos.y,
+        tool: toolRef.current,
+        color: colorRef.current,
+        width: toolRef.current === 'eraser' ? widthRef.current * 4 : widthRef.current,
+        opacity: toolRef.current === 'highlighter' ? 0.35 : opacityRef.current,
+        page: pageRef.current,
+      })
     }
-    strokes.current.push(stroke)
-    undoStack.current.push(stroke)
-    redrawStrokes()
-    socket?.emit('draw-end', { stroke, page: pageRef.current })
-    currentPath.current = []
-  }
+
+    const onMove = (e) => {
+      if (!isDrawing.current) return
+      e.preventDefault()
+      const pos = getCanvasPos(e)
+      currentPath.current.push(pos)
+
+      // Batch renders with rAF — only one repaint per display refresh
+      if (rafRef.current) return
+      rafRef.current = requestAnimationFrame(() => {
+        rafRef.current = null
+        const liveCanvas = drawCanvasRef.current
+        if (!liveCanvas) return
+        const ctx = liveCanvas.getContext('2d')
+        ctx.clearRect(0, 0, liveCanvas.width, liveCanvas.height)
+
+        const pts = currentPath.current
+        const w   = toolRef.current === 'eraser' ? widthRef.current * 4 : widthRef.current
+        const op  = toolRef.current === 'highlighter' ? 0.35 : opacityRef.current
+
+        if (toolRef.current === 'pen') {
+          // Fast live preview: smooth bezier, no variable width (committed stroke gets full GoodNotes render)
+          if (pts.length >= 2) {
+            ctx.save()
+            ctx.globalAlpha = op
+            ctx.strokeStyle = colorRef.current
+            ctx.lineWidth   = w
+            ctx.lineCap     = 'round'
+            ctx.lineJoin    = 'round'
+            ctx.beginPath()
+            ctx.moveTo(pts[0].x, pts[0].y)
+            for (let i = 1; i < pts.length - 1; i++) {
+              ctx.quadraticCurveTo(
+                pts[i].x, pts[i].y,
+                (pts[i].x + pts[i+1].x) / 2,
+                (pts[i].y + pts[i+1].y) / 2
+              )
+            }
+            ctx.lineTo(pts[pts.length-1].x, pts[pts.length-1].y)
+            ctx.stroke()
+            ctx.restore()
+          }
+        } else {
+          drawStroke(ctx, {
+            points: pts, tool: toolRef.current,
+            color: colorRef.current, width: w, opacity: op, page: pageRef.current,
+          })
+        }
+      })
+
+      socket?.emit('draw-move', { x: pos.x, y: pos.y, page: pageRef.current })
+    }
+
+    const onUp = () => {
+      if (!isDrawing.current) return
+      isDrawing.current = false
+      if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null }
+
+      // Clear live canvas
+      const liveCtx = drawCanvasRef.current?.getContext('2d')
+      if (liveCtx) liveCtx.clearRect(0, 0, liveCtx.canvas.width, liveCtx.canvas.height)
+
+      const pts = currentPath.current
+      if (!pts.length) return
+
+      const stroke = {
+        points:  pts,
+        tool:    toolRef.current,
+        color:   colorRef.current,
+        width:   toolRef.current === 'eraser' ? widthRef.current * 4 : widthRef.current,
+        opacity: toolRef.current === 'highlighter' ? 0.35 : opacityRef.current,
+        page:    pageRef.current,
+      }
+
+      strokes.current.push(stroke)
+      undoStack.current.push(stroke)
+
+      // Commit to static canvas with full GoodNotes render
+      const staticCtx = staticCanvasRef.current?.getContext('2d')
+      if (staticCtx) drawStroke(staticCtx, stroke)
+
+      socket?.emit('draw-end', { stroke, page: pageRef.current })
+      currentPath.current = []
+    }
+
+    canvas.addEventListener('pointerdown',   onDown, { passive: false })
+    canvas.addEventListener('pointermove',   onMove, { passive: false })
+    canvas.addEventListener('pointerup',     onUp)
+    canvas.addEventListener('pointercancel', onUp)
+    canvas.addEventListener('pointerleave',  onUp)
+
+    return () => {
+      canvas.removeEventListener('pointerdown',   onDown)
+      canvas.removeEventListener('pointermove',   onMove)
+      canvas.removeEventListener('pointerup',     onUp)
+      canvas.removeEventListener('pointercancel', onUp)
+      canvas.removeEventListener('pointerleave',  onUp)
+      if (rafRef.current) cancelAnimationFrame(rafRef.current)
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [socket])
 
   // ── Toolbar actions ───────────────────────────────────
   const handleUndo = () => {
@@ -617,17 +714,11 @@ export default function DrawingCanvas({
           )}
           <div className="canvas-container" style={{ cursor: getCursor() }}>
             <canvas ref={pdfCanvasRef} id="pdf-canvas" />
-            <canvas
-              ref={drawCanvasRef}
-              id="draw-canvas"
-              onMouseDown={onPointerDown}
-              onMouseMove={onPointerMove}
-              onMouseUp={onPointerUp}
-              onMouseLeave={onPointerUp}
-              onTouchStart={onPointerDown}
-              onTouchMove={onPointerMove}
-              onTouchEnd={onPointerUp}
-            />
+            {/* Static canvas — holds all committed strokes, never cleared during live drawing */}
+            <canvas ref={staticCanvasRef} id="static-canvas" style={{ position: 'absolute', top: 0, left: 0, zIndex: 2, pointerEvents: 'none' }} />
+            {/* Live canvas — only the in-progress stroke, cleared each rAF */}
+            <canvas ref={drawCanvasRef} id="draw-canvas" />
+
             {/* Text tool input overlay */}
             {textPos && (() => {
               const canvas = drawCanvasRef.current
