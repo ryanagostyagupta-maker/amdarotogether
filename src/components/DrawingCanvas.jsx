@@ -2,6 +2,7 @@ import { useEffect, useRef, useCallback, useState } from 'react'
 import * as pdfjsLib from 'pdfjs-dist'
 import { DrawingToolbar } from './Toolbar'
 import ColorPicker from './ColorPicker'
+import gsap from 'gsap'
 
 import { version } from 'pdfjs-dist'
 pdfjsLib.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${version}/build/pdf.worker.min.mjs`
@@ -16,24 +17,34 @@ export default function DrawingCanvas({
   socket, roomId, page, pdfUrl, pdfName: pdfNameProp, onPageChange, totalPages,
   showToast, user, onSignOut, onProposePdf, myId: myIdProp
 }) {
-  const pdfCanvasRef    = useRef()
-  const staticCanvasRef = useRef()   // committed strokes layer
-  const drawCanvasRef   = useRef()   // live / in-progress stroke layer
-  const containerRef    = useRef()
+  const pdfCanvasRef       = useRef()
+  const staticCanvasRef    = useRef()   // committed strokes layer
+  const drawCanvasRef      = useRef()   // live / in-progress stroke layer
+  const containerRef       = useRef()
+  const canvasContainerRef = useRef()   // for CSS transform during pinch
 
   const [tool, setTool]               = useState('pen')
   const [color, setColor]             = useState('#7c6aff')
   const [strokeWidth, setStrokeWidth] = useState(3)
   const [opacity, setOpacity]         = useState(1)
   const [zoom, setZoom]               = useState(1)
-  const [loading, setLoading]         = useState(true)
+  const [loading, setLoading]         = useState(false)
   const [users, setUsers]             = useState([])
   const [myId, setMyId]               = useState(myIdProp || null)
   const [inviteCode, setInviteCode]   = useState('')
   const [copied, setCopied]           = useState(false)
   const [pdfName, setPdfName]         = useState(pdfNameProp || '')
   const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [theme, setTheme]             = useState(() => localStorage.getItem('amdaro-theme') || 'dark')
   const proposeInputRef               = useRef()
+
+  // Apply theme
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme)
+    localStorage.setItem('amdaro-theme', theme)
+  }, [theme])
+
+  const toggleTheme = () => setTheme(t => t === 'dark' ? 'light' : 'dark')
 
   // Text tool state
   const [textPos, setTextPos]     = useState(null)   // {x, y} in canvas coords
@@ -51,12 +62,14 @@ export default function DrawingCanvas({
   const colorRef    = useRef(color)
   const widthRef    = useRef(strokeWidth)
   const opacityRef  = useRef(opacity)
+  const zoomRef     = useRef(zoom)
 
   useEffect(() => { toolRef.current = tool }, [tool])
   useEffect(() => { colorRef.current = color }, [color])
   useEffect(() => { widthRef.current = strokeWidth }, [strokeWidth])
   useEffect(() => { opacityRef.current = opacity }, [opacity])
   useEffect(() => { pageRef.current = page }, [page])
+  useEffect(() => { zoomRef.current = zoom }, [zoom])
 
   const renderTaskRef = useRef(null)
 
@@ -77,23 +90,21 @@ export default function DrawingCanvas({
   const renderPage = useCallback(async (pageNum) => {
     if (!pdfDocRef.current) return
 
-    // Cancel any active rendering task to prevent concurrency exceptions
     if (renderTaskRef.current) {
-      try {
-        renderTaskRef.current.cancel()
-      } catch (err) {
-        console.warn("PDF render cancel warning:", err)
-      }
+      try { renderTaskRef.current.cancel() } catch {}
     }
 
-    setLoading(true)
+    // Optimistic: don't show spinner — keep old page visible until render completes
     try {
       const pdfPage = await pdfDocRef.current.getPage(pageNum)
-      const viewport = pdfPage.getViewport({ scale: zoom * 1.5 })
+      const viewport = pdfPage.getViewport({ scale: zoomRef.current * 1.5 })
 
       const pdfCanvas  = pdfCanvasRef.current
       const drawCanvas = drawCanvasRef.current
-      if (!pdfCanvas) return
+      if (!pdfCanvas || !drawCanvas) return
+
+      // Reset any CSS pinch-zoom transform
+      if (canvasContainerRef.current) canvasContainerRef.current.style.transform = ''
 
       pdfCanvas.width  = viewport.width
       pdfCanvas.height = viewport.height
@@ -107,13 +118,11 @@ export default function DrawingCanvas({
       const ctx = pdfCanvas.getContext('2d')
       const renderTask = pdfPage.render({ canvasContext: ctx, viewport })
       renderTaskRef.current = renderTask
-
       await renderTask.promise
       redrawStrokes()
     } catch (err) {
-      if (err.name !== 'RenderingCancelledException') {
-        console.error("PDF page render error:", err)
-        showToast('Failed to load PDF page', 'error')
+      if (err?.name !== 'RenderingCancelledException') {
+        console.error('PDF render error:', err)
       }
     } finally {
       setLoading(false)
@@ -287,7 +296,7 @@ export default function DrawingCanvas({
     if (stroke.tool === 'text') {
       ctx.globalCompositeOperation = 'source-over'
       ctx.fillStyle = stroke.color
-      ctx.font = `${Math.max(12, stroke.width * 4)}px Inter, -apple-system, sans-serif`
+      ctx.font = `${Math.max(12, stroke.width * 4)}px "Plus Jakarta Sans", -apple-system, sans-serif`
       ctx.fillText(stroke.text || '', stroke.points[0].x, stroke.points[0].y)
       ctx.restore(); return
     }
@@ -314,6 +323,23 @@ export default function DrawingCanvas({
       ctx.beginPath()
       stroke.points.forEach((pt, i) => i === 0 ? ctx.moveTo(pt.x, pt.y) : ctx.lineTo(pt.x, pt.y))
       ctx.stroke()
+      ctx.restore(); return
+    }
+
+    // ── Circle ──
+    if (stroke.tool === 'circle') {
+      ctx.globalCompositeOperation = 'source-over'
+      ctx.strokeStyle = stroke.color
+      ctx.fillStyle   = stroke.color + '18'
+      if (stroke.points.length >= 2) {
+        const s = stroke.points[0]
+        const e = stroke.points[stroke.points.length - 1]
+        const cx = (s.x + e.x) / 2, cy = (s.y + e.y) / 2
+        const rx = Math.abs(e.x - s.x) / 2, ry = Math.abs(e.y - s.y) / 2
+        ctx.lineWidth = stroke.width
+        ctx.beginPath(); ctx.ellipse(cx, cy, rx || 1, ry || 1, 0, 0, Math.PI * 2)
+        ctx.fill(); ctx.stroke()
+      }
       ctx.restore(); return
     }
 
@@ -360,26 +386,76 @@ export default function DrawingCanvas({
     drawSmoothPen(ctx, stroke.points, stroke.width, stroke.color, stroke.opacity ?? 1)
   }
 
-  // ── Pointer events ────────────────────────────────────
-  // ── Native Pointer Events (low-latency, Apple Pencil aware) ──────────
-  const rafRef = useRef(null)
+  const isSpaceHeld     = useRef(false)
+  const [spacePan, setSpacePan] = useState(false)
+  const isPanning       = useRef(false)
+  const lastPanPos      = useRef({ x: 0, y: 0 })
+
+  const rafRef          = useRef(null)
+  const activePointers  = useRef(new Map())
+  const pinchStartDist  = useRef(null)
+  const pinchStartZoom  = useRef(1)
+  const pendingZoom     = useRef(null)
+
+  // Wheel / trackpad pinch zoom
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el) return
+    const onWheel = (e) => {
+      if (e.ctrlKey || e.metaKey) {
+        e.preventDefault()
+        const factor = e.deltaY > 0 ? 0.9 : 1.1
+        setZoom(z => Math.max(0.4, Math.min(4, z * factor)))
+      }
+    }
+    el.addEventListener('wheel', onWheel, { passive: false })
+    return () => el.removeEventListener('wheel', onWheel)
+  }, [])
 
   useEffect(() => {
     const canvas = drawCanvasRef.current
     if (!canvas) return
+    let isSharpening = false
+    let holdTimer = null
 
     const getCanvasPos = (e) => {
-      const rect  = canvas.getBoundingClientRect()
-      const scaleX = canvas.width  / rect.width
+      const rect = canvas.getBoundingClientRect()
+      const scaleX = canvas.width / rect.width
       const scaleY = canvas.height / rect.height
       return {
         x: (e.clientX - rect.left) * scaleX,
-        y: (e.clientY - rect.top)  * scaleY,
-        pressure: e.pressure > 0 ? e.pressure : 0.5,
+        y: (e.clientY - rect.top) * scaleY
       }
+    }
+    const getPinchDist = () => {
+      if (activePointers.current.size < 2) return null
+      const pts = Array.from(activePointers.current.values())
+      return Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y)
     }
 
     const onDown = (e) => {
+      activePointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY })
+
+      // Two fingers → start pinch
+      if (activePointers.current.size === 2) {
+        if (isDrawing.current) {
+          isDrawing.current = false
+          currentPath.current = []
+          const liveCtx = drawCanvasRef.current?.getContext('2d')
+          if (liveCtx) liveCtx.clearRect(0, 0, liveCtx.canvas.width, liveCtx.canvas.height)
+        }
+        pinchStartDist.current = getPinchDist()
+        pinchStartZoom.current = zoomRef.current
+        return
+      }
+
+      // ── Pan tool or Spacebar ──
+      // Handled natively via pointer-events: none on the canvas container
+      if (toolRef.current === 'pan' || isSpaceHeld.current) {
+        return
+      }
+
+      // ── Text tool ──
       if (toolRef.current === 'text') {
         const pos = getCanvasPos(e)
         setTextPos({ x: pos.x, y: pos.y })
@@ -387,9 +463,74 @@ export default function DrawingCanvas({
         setTimeout(() => textInputRef.current?.focus(), 0)
         return
       }
+
+      // ── Stroke eraser (handled in onMove for swipe deletion) ──
+      if (toolRef.current === 'stroke-eraser') {
+        e.preventDefault()
+        canvas.setPointerCapture(e.pointerId)
+        isDrawing.current = true
+        return
+      }
+
       e.preventDefault()
       canvas.setPointerCapture(e.pointerId)
       isDrawing.current = true
+      holdTimer = setTimeout(() => {
+        // Shape sharpening activates after 600ms hold
+        if (['rectangle', 'circle', 'arrow', 'pen'].includes(toolRef.current)) {
+          let wasSharpened = false
+
+          // Pen-to-shape recognition
+          if (toolRef.current === 'pen') {
+            const pts = currentPath.current
+            if (pts.length > 10) {
+              const s = pts[0], e = pts[pts.length - 1]
+              const dist = Math.hypot(e.x - s.x, e.y - s.y)
+              let pathLen = 0
+              for(let i=1; i<pts.length; i++) pathLen += Math.hypot(pts[i].x-pts[i-1].x, pts[i].y-pts[i-1].y)
+              
+              if (dist < 40) {
+                 // Closed shape (Circle or Rectangle)
+                 let minX = s.x, maxX = s.x, minY = s.y, maxY = s.y
+                 pts.forEach(p => { 
+                   minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x)
+                   minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y) 
+                 })
+                 const w = maxX - minX, h = maxY - minY
+                 if (Math.abs(w - h) < Math.max(w, h) * 0.35) {
+                   toolRef.current = 'circle'
+                 } else {
+                   toolRef.current = 'rectangle'
+                 }
+                 currentPath.current = [{x: minX, y: minY}, {x: maxX, y: maxY}]
+                 wasSharpened = true
+              } else if (dist > pathLen * 0.85) {
+                 // Straight Line
+                 currentPath.current = [s, e]
+                 wasSharpened = true
+              }
+            }
+          }
+
+          if (wasSharpened || ['rectangle', 'circle', 'arrow'].includes(toolRef.current)) {
+            isSharpening = true
+            // Visual pulse feedback
+            const cc = canvasContainerRef.current
+            if (cc) {
+              cc.style.outline = '2px solid rgba(124,106,255,0.7)'
+              cc.style.outlineOffset = '2px'
+              setTimeout(() => { if (cc) { cc.style.outline = ''; cc.style.outlineOffset = '' } }, 400)
+            }
+            // Force redraw of live canvas
+            const liveCanvas = drawCanvasRef.current
+            if (liveCanvas) {
+              const ctx = liveCanvas.getContext('2d')
+              ctx.clearRect(0, 0, liveCanvas.width, liveCanvas.height)
+              drawStroke(ctx, { points: currentPath.current, tool: toolRef.current, color: colorRef.current, width: widthRef.current, opacity: opacityRef.current, page: pageRef.current })
+            }
+          }
+        }
+      }, 600)
       const pos = getCanvasPos(e)
       currentPath.current = [pos]
       socket?.emit('draw-start', {
@@ -403,12 +544,66 @@ export default function DrawingCanvas({
     }
 
     const onMove = (e) => {
+      activePointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY })
+
+      // Pinch zoom in progress
+      if (activePointers.current.size >= 2 && pinchStartDist.current) {
+        const dist = getPinchDist()
+        if (!dist) return
+        const scale   = dist / pinchStartDist.current
+        const newZoom = Math.max(0.4, Math.min(4, pinchStartZoom.current * scale))
+        if (canvasContainerRef.current) {
+          const ratio = newZoom / zoomRef.current
+          canvasContainerRef.current.style.transform = `scale(${ratio})`
+          canvasContainerRef.current.style.transformOrigin = 'center center'
+        }
+        pendingZoom.current = newZoom
+        return
+      }
+
+      // ── Pan Tool ──
+      // Handled natively via pointer-events: none on the canvas container
+      if (toolRef.current === 'pan' || isSpaceHeld.current) {
+        return
+      }
+
       if (!isDrawing.current) return
       e.preventDefault()
-      const pos = getCanvasPos(e)
-      currentPath.current.push(pos)
 
-      // Batch renders with rAF — only one repaint per display refresh
+      // ── Stroke Eraser Swipe ──
+      if (toolRef.current === 'stroke-eraser') {
+        const pos = getCanvasPos(e)
+        const scale = drawCanvasRef.current ? drawCanvasRef.current.width / drawCanvasRef.current.getBoundingClientRect().width : 1
+        const TOLERANCE = 18 * scale
+        let hitIdx = -1
+        for (let i = strokes.current.length - 1; i >= 0; i--) {
+          const s = strokes.current[i]
+          if (s.page !== pageRef.current) continue
+          const hit = s.points.some(pt => Math.hypot(pt.x - pos.x, pt.y - pos.y) < TOLERANCE)
+          if (hit) { hitIdx = i; break }
+        }
+        if (hitIdx >= 0) {
+          const removed = strokes.current.splice(hitIdx, 1)[0]
+          redrawStrokes()
+          socket?.emit('sync-strokes', { strokes: strokes.current })
+          undoStack.current.push({ type: 'delete', stroke: removed, index: hitIdx })
+        }
+        return
+      }
+
+      // ✨ getCoalescedEvents — Apple Pencil reports at 120–240 Hz but
+      // browsers only fire pointermove once per rAF. Coalesced events give us
+      // ALL the intermediate points, making lines smooth instead of dotted.
+      const events = (e.getCoalescedEvents ? e.getCoalescedEvents() : null)
+      if (events && events.length > 0) {
+        for (const ce of events) {
+          currentPath.current.push(getCanvasPos(ce))
+        }
+      } else {
+        currentPath.current.push(getCanvasPos(e))
+      }
+
+      // One render per display frame — but we’ve already collected every point above
       if (rafRef.current) return
       rafRef.current = requestAnimationFrame(() => {
         rafRef.current = null
@@ -422,14 +617,12 @@ export default function DrawingCanvas({
         const op  = toolRef.current === 'highlighter' ? 0.35 : opacityRef.current
 
         if (toolRef.current === 'pen') {
-          // Fast live preview: smooth bezier, no variable width (committed stroke gets full GoodNotes render)
           if (pts.length >= 2) {
             ctx.save()
             ctx.globalAlpha = op
             ctx.strokeStyle = colorRef.current
             ctx.lineWidth   = w
-            ctx.lineCap     = 'round'
-            ctx.lineJoin    = 'round'
+            ctx.lineCap = 'round'; ctx.lineJoin = 'round'
             ctx.beginPath()
             ctx.moveTo(pts[0].x, pts[0].y)
             for (let i = 1; i < pts.length - 1; i++) {
@@ -440,34 +633,72 @@ export default function DrawingCanvas({
               )
             }
             ctx.lineTo(pts[pts.length-1].x, pts[pts.length-1].y)
-            ctx.stroke()
-            ctx.restore()
+            ctx.stroke(); ctx.restore()
           }
         } else {
-          drawStroke(ctx, {
-            points: pts, tool: toolRef.current,
-            color: colorRef.current, width: w, opacity: op, page: pageRef.current,
-          })
+          drawStroke(ctx, { points: pts, tool: toolRef.current, color: colorRef.current, width: w, opacity: op, page: pageRef.current })
         }
       })
 
-      socket?.emit('draw-move', { x: pos.x, y: pos.y, page: pageRef.current })
+      // Emit only the latest position (network efficiency)
+      const last = currentPath.current[currentPath.current.length - 1]
+      socket?.emit('draw-move', { x: last.x, y: last.y, page: pageRef.current })
     }
 
-    const onUp = () => {
+    const onUp = (e) => {
+      activePointers.current.delete(e.pointerId)
+      if (holdTimer) { clearTimeout(holdTimer); holdTimer = null }
+
+      // Pinch ended — apply zoom
+      if (pendingZoom.current !== null && activePointers.current.size < 2) {
+        const finalZoom = pendingZoom.current
+        pendingZoom.current = null
+        pinchStartDist.current = null
+        if (canvasContainerRef.current) canvasContainerRef.current.style.transform = ''
+        setZoom(finalZoom)
+        return
+      }
+
       if (!isDrawing.current) return
       isDrawing.current = false
       if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null }
 
-      // Clear live canvas
       const liveCtx = drawCanvasRef.current?.getContext('2d')
       if (liveCtx) liveCtx.clearRect(0, 0, liveCtx.canvas.width, liveCtx.canvas.height)
 
-      const pts = currentPath.current
-      if (!pts.length) return
+      let pts = currentPath.current
+      if (!pts.length) { isSharpening = false; return }
+
+      // ── Shape sharpening — snap to perfect form after hold ──
+      if (isSharpening && pts.length >= 2) {
+        const s = pts[0], last = pts[pts.length - 1]
+        if (toolRef.current === 'circle') {
+          // Snap to perfect circle
+          const cx = (s.x + last.x) / 2, cy = (s.y + last.y) / 2
+          const r  = Math.min(Math.abs(last.x - s.x), Math.abs(last.y - s.y)) / 2
+          pts = [{ x: cx - r, y: cy - r }, { x: cx + r, y: cy + r }]
+        } else if (toolRef.current === 'rectangle') {
+          // Snap to square if nearly square (within 20%)
+          const w = Math.abs(last.x - s.x), h = Math.abs(last.y - s.y)
+          const side = Math.max(w, h)
+          pts = [
+            s,
+            { x: s.x + (last.x > s.x ? side : -side), y: s.y + (last.y > s.y ? side : -side) }
+          ]
+        } else if (toolRef.current === 'arrow') {
+          // Snap to nearest 15° increment
+          const angle = Math.atan2(last.y - s.y, last.x - s.x)
+          const snap  = Math.round(angle / (Math.PI / 12)) * (Math.PI / 12)
+          const dist  = Math.hypot(last.x - s.x, last.y - s.y)
+          pts = [s, { x: s.x + dist * Math.cos(snap), y: s.y + dist * Math.sin(snap) }]
+        }
+        currentPath.current = pts
+        isSharpening = false
+      }
 
       const stroke = {
-        points:  pts,
+        id:      Math.random().toString(36).slice(2),
+        points:  currentPath.current,
         tool:    toolRef.current,
         color:   colorRef.current,
         width:   toolRef.current === 'eraser' ? widthRef.current * 4 : widthRef.current,
@@ -477,11 +708,8 @@ export default function DrawingCanvas({
 
       strokes.current.push(stroke)
       undoStack.current.push(stroke)
-
-      // Commit to static canvas with full GoodNotes render
       const staticCtx = staticCanvasRef.current?.getContext('2d')
       if (staticCtx) drawStroke(staticCtx, stroke)
-
       socket?.emit('draw-end', { stroke, page: pageRef.current })
       currentPath.current = []
     }
@@ -490,7 +718,14 @@ export default function DrawingCanvas({
     canvas.addEventListener('pointermove',   onMove, { passive: false })
     canvas.addEventListener('pointerup',     onUp)
     canvas.addEventListener('pointercancel', onUp)
-    canvas.addEventListener('pointerleave',  onUp)
+    // pointerleave: only commit for mouse/touch — NOT for pen.
+    // Apple Pencil constantly triggers leave/enter at low pressure, which
+    // fragments strokes into dots. setPointerCapture already keeps pen
+    // events flowing even outside the canvas.
+    canvas.addEventListener('pointerleave', (e) => {
+      if (e.pointerType === 'pen') return
+      onUp(e)
+    })
 
     return () => {
       canvas.removeEventListener('pointerdown',   onDown)
@@ -512,6 +747,32 @@ export default function DrawingCanvas({
     socket?.emit('undo')
   }
 
+  // ── Keyboard Shortcuts (Undo, Pan) ──
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return
+
+      if (e.type === 'keydown' && (e.ctrlKey || e.metaKey)) {
+        if (e.key === 'z') {
+          e.preventDefault()
+          handleUndo()
+        }
+      }
+
+      if (e.code === 'Space') {
+        isSpaceHeld.current = e.type === 'keydown'
+        if (e.type === 'keydown') e.preventDefault()
+        setSpacePan(e.type === 'keydown')
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    window.addEventListener('keyup', onKey)
+    return () => {
+      window.removeEventListener('keydown', onKey)
+      window.removeEventListener('keyup', onKey)
+    }
+  }, [])
+
   const handleClearPage = () => {
     strokes.current = strokes.current.filter(s => s.page !== pageRef.current)
     redrawStrokes()
@@ -525,10 +786,10 @@ export default function DrawingCanvas({
     showToast('Share link copied!', 'success')
   }
 
-  // Commit text to canvas + sync
+  // Commit text → static canvas (bug fix: was using drawCanvasRef)
   const commitText = () => {
     if (!textPos || !textVal.trim()) { setTextPos(null); return }
-    const ctx = drawCanvasRef.current?.getContext('2d')
+    const ctx = staticCanvasRef.current?.getContext('2d')   // ← fixed
     if (!ctx) { setTextPos(null); return }
     const stroke = {
       tool: 'text',
@@ -555,115 +816,152 @@ export default function DrawingCanvas({
   }
 
   const getCursor = () => {
+    if (isSpaceHeld.current || tool === 'pan') return 'grab'
     if (tool === 'eraser')    return 'cell'
     if (tool === 'text')      return 'text'
     if (tool === 'rectangle') return 'crosshair'
     return 'crosshair'
   }
 
+  const sidebarRef = useRef()
+
+  // ── GSAP Sidebar Animation ──
+  useEffect(() => {
+    if (!sidebarRef.current) return
+    if (sidebarOpen) {
+      gsap.to(sidebarRef.current, {
+        x: 0,
+        opacity: 1,
+        scale: 1,
+        duration: 0.5,
+        ease: 'power3.out',
+        clearProps: 'transform' // Let CSS handle base state
+      })
+    } else {
+      gsap.to(sidebarRef.current, {
+        x: -280,
+        opacity: 0,
+        scale: 0.96,
+        duration: 0.35,
+        ease: 'power3.in'
+      })
+    }
+  }, [sidebarOpen])
+
   return (
     <div className="workspace">
       {/* ── Sidebar ── */}
-      <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`}>
+      <aside
+        className="sidebar"
+        ref={sidebarRef}
+        style={{
+          transform: sidebarOpen ? 'translateX(0) scale(1)' : 'translateX(-280px) scale(0.96)',
+          opacity: sidebarOpen ? 1 : 0,
+          pointerEvents: sidebarOpen ? 'auto' : 'none',
+        }}
+      >
 
-        {/* Header */}
-        <div className="sb-row" style={{ justifyContent: 'space-between', padding: '12px 14px' }}>
+        {/* ── Header ── */}
+        <div className="sb-row" style={{ justifyContent: 'space-between', minHeight: 52, padding: '0 12px 0 16px' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <img src="/logo.svg" alt="Amdaro" style={{ width: 16, height: 16, opacity: 0.9 }} />
-            <span style={{ fontSize: 13, fontWeight: 700, letterSpacing: '-0.3px', color: 'rgba(255,255,255,0.9)' }}>amdaro</span>
+            <img src="/logo.svg" alt="" style={{ width: 18, height: 18, opacity: 0.85 }} />
+            <span style={{ fontSize: 14, fontWeight: 600, color: 'rgba(255,255,255,0.88)', letterSpacing: '-0.2px' }}>
+              amdaro
+            </span>
           </div>
-          <button className="sb-icon-btn" onClick={() => setSidebarOpen(false)} title="Close">
-            <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
-              <path d="M1 1l10 10M11 1L1 11" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
+          <button className="sb-icon-btn" onClick={() => setSidebarOpen(false)} aria-label="Close">
+            <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
+              <path d="M1 1l8 8M9 1L1 9" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
             </svg>
           </button>
         </div>
 
-        {/* PDF name */}
+        {/* ── PDF name ── */}
         {pdfName && (
-          <div className="sb-row" style={{ gap: 6 }}>
-            <span style={{ fontSize: 10, opacity: 0.4 }}>📄</span>
-            <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.45)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={pdfName}>
+          <div className="sb-row" style={{ minHeight: 36, gap: 8 }}>
+            <span style={{ fontSize: 11, opacity: 0.3 }}>PDF</span>
+            <span style={{ fontSize: 12, color: 'rgba(255,255,255,0.5)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={pdfName}>
               {pdfName}
             </span>
           </div>
         )}
 
-        {/* Colour picker */}
-        <div className="sb-row" style={{ flexDirection: 'column', alignItems: 'stretch', gap: 10, padding: '12px 14px' }}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <span className="sb-label">Colour</span>
-            <ColorPicker color={color} onChange={setColor} />
-          </div>
+        {/* ── Colour ── */}
+        <div className="sb-row" style={{ justifyContent: 'space-between' }}>
+          <span className="sb-label">Colour</span>
+          <ColorPicker color={color} onChange={setColor} />
         </div>
 
-        {/* Stroke size */}
-        <div className="sb-row" style={{ gap: 10 }}>
-          <span className="sb-label" style={{ minWidth: 30 }}>{strokeWidth}px</span>
+        {/* ── Size ── */}
+        <div className="sb-row" style={{ gap: 12 }}>
+          <span className="sb-label" style={{ width: 32 }}>{strokeWidth}px</span>
           <input
-            type="range" min="1" max="30" value={strokeWidth}
+            type="range" min="1" max="30"
+            value={strokeWidth}
             className="sb-slider"
             onChange={e => setStrokeWidth(+e.target.value)}
-            style={{ flex: 1, accentColor: color }}
           />
         </div>
 
-        {/* Opacity */}
+        {/* ── Opacity ── */}
         {tool !== 'highlighter' && tool !== 'eraser' && (
-          <div className="sb-row" style={{ gap: 10 }}>
-            <span className="sb-label" style={{ minWidth: 30 }}>{Math.round(opacity * 100)}%</span>
+          <div className="sb-row" style={{ gap: 12 }}>
+            <span className="sb-label" style={{ width: 32 }}>{Math.round(opacity * 100)}%</span>
             <input
               type="range" min="10" max="100"
               value={Math.round(opacity * 100)}
               className="sb-slider"
               onChange={e => setOpacity(e.target.value / 100)}
-              style={{ flex: 1, accentColor: color }}
             />
           </div>
         )}
 
-        {/* Session code */}
+        {/* ── Session code ── */}
         <div className="sb-row" style={{ justifyContent: 'space-between' }}>
-          <span className="sb-code">{inviteCode || '— — — — — —'}</span>
+          <span className="sb-code">{inviteCode || '– – – – – –'}</span>
           <button
             className="sb-icon-btn"
             onClick={copyInviteCode}
-            title="Copy session code"
-            style={{ color: copied ? '#22c55e' : undefined }}
+            title="Copy"
+            style={{ color: copied ? '#34d399' : undefined, transition: 'color 0.2s' }}
           >
             {copied
-              ? <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M2 7l3.5 3.5L12 3" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
-              : <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><rect x="4" y="1" width="9" height="9" rx="2" stroke="currentColor" strokeWidth="1.2"/><path d="M1 5v8h8" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/></svg>
+              ? <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M1.5 6.5l3.5 3.5 6.5-7" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"/></svg>
+              : <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><rect x="4.5" y="1" width="7.5" height="7.5" rx="1.5" stroke="currentColor" strokeWidth="1.2"/><path d="M1 4.5v7.5h7.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/></svg>
             }
           </button>
         </div>
 
-        {/* Online users */}
-        <div style={{ flex: 1, overflowY: 'auto', padding: '10px 14px 6px' }}>
-          <div className="sb-label" style={{ marginBottom: 10 }}>Online · {users.length}</div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        {/* ── Online users ── */}
+        <div style={{ overflowY: 'auto', padding: '12px 16px 8px' }}>
+          <div className="sb-label" style={{ marginBottom: 10 }}>
+            In room · {users.length}
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
             {users.map(u => (
-              <div key={u.id} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <div key={u.id} style={{ display: 'flex', alignItems: 'center', gap: 9 }}>
                 <div className="sb-user-dot" style={{ background: u.color, color: u.color }} />
                 <span style={{
-                  fontSize: 12, color: 'rgba(255,255,255,0.6)',
+                  fontSize: 13,
+                  color: u.id === myId ? 'rgba(255,255,255,0.8)' : 'rgba(255,255,255,0.5)',
                   overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                   fontWeight: u.id === myId ? 500 : 400,
                 }}>
-                  {u.name}{u.id === myId ? <span style={{ color: 'rgba(255,255,255,0.25)', fontSize: 10 }}> you</span> : null}
+                  {u.name}
+                  {u.id === myId && <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.22)', marginLeft: 4 }}>you</span>}
                 </span>
               </div>
             ))}
           </div>
         </div>
 
-        {/* Propose PDF */}
+        {/* ── Propose PDF ── */}
         {onProposePdf && (
-          <div style={{ padding: '8px 14px', borderTop: '1px solid rgba(255,255,255,0.04)' }}>
+          <div style={{ padding: '8px 12px' }}>
             <button className="sb-propose-btn" onClick={() => proposeInputRef.current?.click()}>
-              <svg width="13" height="13" viewBox="0 0 13 13" fill="none">
-                <path d="M6.5 1v8M2.5 5l4-4 4 4" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"/>
-                <path d="M1 11h11" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/>
+              <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+                <path d="M6 1v7M2 5l4-4 4 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+                <path d="M1 11h10" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
               </svg>
               Propose PDF
             </button>
@@ -673,23 +971,24 @@ export default function DrawingCanvas({
           </div>
         )}
 
-        {/* Sign out */}
+        {/* ── Account ── */}
         {user && (
-          <div className="sb-row" style={{ justifyContent: 'space-between', padding: '10px 14px' }}>
-            <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.3)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 140 }} title={user.email}>
+          <div className="sb-row" style={{ justifyContent: 'space-between', minHeight: 48, borderTop: '0.5px solid rgba(255,255,255,0.06)' }}>
+            <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.28)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 148 }} title={user.email}>
               {user.email}
             </span>
             <button
               onClick={onSignOut}
-              style={{ background: 'none', border: 'none', color: 'rgba(239,68,68,0.7)', fontSize: 11, fontWeight: 600, cursor: 'pointer', flexShrink: 0, transition: 'color 0.15s' }}
-              onMouseEnter={e => e.target.style.color = '#ef4444'}
-              onMouseLeave={e => e.target.style.color = 'rgba(239,68,68,0.7)'}
+              style={{ background: 'none', border: 'none', color: 'rgba(239,68,68,0.6)', fontSize: 12, fontWeight: 500, cursor: 'pointer', flexShrink: 0, transition: 'color 0.15s', padding: '4px 0 4px 8px' }}
+              onMouseEnter={e => e.target.style.color = '#f87171'}
+              onMouseLeave={e => e.target.style.color = 'rgba(239,68,68,0.6)'}
             >
               Sign out
             </button>
           </div>
         )}
       </aside>
+
 
       {/* ── PDF Canvas Area ── */}
       <div className="pdf-area">
@@ -725,22 +1024,39 @@ export default function DrawingCanvas({
           </div>
         </div>
 
-        {/* PDF scroll */}
-        <div className="pdf-scroll" ref={containerRef}>
+        {/* PDF scroll — touch-action:pan-xy allows two-finger pan but we intercept pinch */}
+        <div className="pdf-scroll" ref={containerRef} style={{ touchAction: 'pan-x pan-y' }}>
+          {/* Subtle loading indicator — doesn't hide content */}
           {loading && (
-            <div className="loading-overlay">
-              <div className="spinner" />
-              <p className="loading-text">Rendering PDF…</p>
+            <div style={{
+              position: 'absolute', top: 12, right: 12, zIndex: 50,
+              background: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(8px)',
+              borderRadius: 8, padding: '6px 10px',
+              display: 'flex', alignItems: 'center', gap: 6,
+            }}>
+              <div style={{
+                width: 12, height: 12, borderRadius: '50%',
+                border: '2px solid rgba(255,255,255,0.2)',
+                borderTopColor: '#fff',
+                animation: 'spin 0.7s linear infinite',
+              }} />
+              <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.6)' }}>Rendering…</span>
             </div>
           )}
-          <div className="canvas-container" style={{ cursor: getCursor() }}>
-            <canvas ref={pdfCanvasRef} id="pdf-canvas" />
-            {/* Static canvas — holds all committed strokes, never cleared during live drawing */}
+          <div
+            ref={canvasContainerRef}
+            className="canvas-container"
+            style={{ 
+              cursor: getCursor(), 
+              transition: 'transform 0.05s',
+              pointerEvents: (tool === 'pan' || spacePan) ? 'none' : 'auto'
+            }}
+          >
+            <canvas ref={pdfCanvasRef} id="pdf-canvas" style={{ pointerEvents: 'none' }} />
             <canvas ref={staticCanvasRef} id="static-canvas" style={{ position: 'absolute', top: 0, left: 0, zIndex: 2, pointerEvents: 'none' }} />
-            {/* Live canvas — only the in-progress stroke, cleared each rAF */}
             <canvas ref={drawCanvasRef} id="draw-canvas" />
 
-            {/* Text tool input overlay */}
+            {/* Text tool overlay */}
             {textPos && (() => {
               const canvas = drawCanvasRef.current
               const rect   = canvas?.getBoundingClientRect()
@@ -748,7 +1064,6 @@ export default function DrawingCanvas({
               const scaleY = rect ? canvas.height / rect.height : 1
               const left   = rect ? rect.left + textPos.x / scaleX : textPos.x
               const top    = rect ? rect.top  + textPos.y / scaleY : textPos.y
-              const fontSize = Math.max(12, strokeWidth * 4)
               return (
                 <textarea
                   ref={textInputRef}
@@ -759,51 +1074,53 @@ export default function DrawingCanvas({
                     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); commitText() }
                   }}
                   onBlur={commitText}
-                  style={{
-                    position: 'fixed',
-                    left, top,
-                    minWidth: 120,
-                    maxWidth: 400,
-                    background: 'rgba(0,0,0,0.6)',
-                    backdropFilter: 'blur(8px)',
-                    border: `1px solid ${color}44`,
-                    borderRadius: 6,
-                    color,
-                    fontSize,
-                    fontFamily: 'Inter, -apple-system, sans-serif',
-                    padding: '4px 8px',
-                    outline: 'none',
-                    resize: 'none',
-                    overflow: 'hidden',
-                    lineHeight: 1.4,
-                    zIndex: 1000,
-                    boxShadow: `0 0 0 2px ${color}33`,
-                    rows: 1,
-                  }}
                   rows={1}
-                  placeholder="Type text…"
+                  placeholder="Type…"
+                  style={{
+                    position: 'fixed', left, top,
+                    minWidth: 100, maxWidth: 400,
+                    background: 'rgba(0,0,0,0.7)',
+                    backdropFilter: 'blur(12px)',
+                    border: `1.5px solid ${color}55`,
+                    borderRadius: 8, color,
+                    fontSize: Math.max(13, strokeWidth * 4),
+                    fontFamily: '"Plus Jakarta Sans", -apple-system, sans-serif',
+                    padding: '5px 10px', outline: 'none',
+                    resize: 'none', overflow: 'hidden',
+                    lineHeight: 1.45, zIndex: 1000,
+                    boxShadow: `0 0 0 3px ${color}22, 0 8px 24px rgba(0,0,0,0.4)`,
+                  }}
                 />
               )
             })()}
           </div>
         </div>
 
-        {/* ── Floating Toolbar (KokonutUI) ── */}
-        <div style={{
-          position: 'absolute',
-          bottom: 28,
-          left: '50%',
-          transform: 'translateX(-50%)',
-          zIndex: 50,
-        }}>
+        {/* Floating toolbar */}
+        <div style={{ position: 'absolute', bottom: 28, left: '50%', transform: 'translateX(-50%)', zIndex: 50 }}>
           <DrawingToolbar
-            tool={tool}
-            onToolSelect={setTool}
-            onUndo={handleUndo}
-            onClear={handleClearPage}
-            onCopyLink={handleCopyLink}
+            tool={tool} onToolSelect={setTool}
+            onUndo={handleUndo} onClear={handleClearPage} onCopyLink={handleCopyLink}
           />
         </div>
+
+        {/* Zoom badge — tap to reset */}
+        <button
+          onClick={() => setZoom(1)}
+          title="Reset zoom"
+          style={{
+            position: 'absolute', bottom: 28, right: 16, zIndex: 50,
+            background: 'rgba(0,0,0,0.55)', backdropFilter: 'blur(12px)',
+            border: '1px solid rgba(255,255,255,0.1)',
+            borderRadius: 8, padding: '5px 10px',
+            color: zoom === 1 ? 'rgba(255,255,255,0.35)' : 'rgba(255,255,255,0.8)',
+            fontSize: 11, fontWeight: 600, cursor: 'pointer',
+            transition: 'color 0.15s',
+            fontFamily: 'SF Mono, Fira Code, monospace',
+          }}
+        >
+          {Math.round(zoom * 100)}%
+        </button>
       </div>
     </div>
   )
